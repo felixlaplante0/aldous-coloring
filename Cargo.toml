@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-dashmap = "6.2.1"
 eframe = "0.37.0"
+quick_cache = "0.7"
+rand = "0.10"
+rand_distr = "0.6"
+rand_xoshiro = "0.8"
 rayon = "1.12.0"
