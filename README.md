@@ -4,6 +4,10 @@ Interactive explorer for Aldous' Poissonian coloring at n = ∞, with zoom down 
 
 Requires Rust 1.95 or newer.
 
+## Video
+
+[Watch the explanatory video in French](aldous_explained.mp4) (9 min 36, 1080p, with embedded subtitles and no voice-over).
+
 ## Build
 
 ```sh
