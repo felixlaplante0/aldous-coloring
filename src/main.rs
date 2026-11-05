@@ -1,94 +1,67 @@
 mod process;
 
 use eframe::egui;
-use egui::{Color32, ColorImage, Pos2, Rect, Sense, Stroke, TextureHandle, TextureOptions, Vec2};
-use process::{DOMAIN, MAX_LEVEL, Stats, Tiles, View, World, level_for, mix, unit};
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-use std::sync::{Arc, Condvar, Mutex};
-use std::time::Instant;
+use egui::{Color32, ColorImage, Pos2, Rangef, Rect, Sense, Stroke, TextureHandle, TextureOptions, emath::OrderedFloat, pos2, remap};
+use process::{DOMAIN, MAX_LEVEL, RASTER, TileId, World, level_for, render_tile, s_top};
+use quick_cache::unsync::Cache;
+use rand::{RngExt, SeedableRng};
+use rand_xoshiro::SplitMix64;
+use rayon::prelude::*;
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::{Arc, mpsc};
 
-const BACKGROUND: [u8; 3] = [18, 18, 22];
+const BACKGROUND: Color32 = Color32::from_rgb(18, 18, 22);
 const PICK_RADIUS: f32 = 14.0;
+const MIN_SCALE: f64 = (DOMAIN >> (MAX_LEVEL + 1)) as f64;
+/// Raster tiles kept on the GPU, about 266 KiB each.
+const TEXTURE_BUDGET: usize = 1024;
 
-struct Job {
-    id: u64,
-    world: Arc<World>,
-    view: View,
+type Rendered = (u64, TileId, ColorImage);
+
+/// Everything a tile's pixels depend on, apart from its id. The UI edits these directly.
+#[derive(Clone, PartialEq)]
+struct Params {
+    rain: u64,
+    seeds: Vec<(u64, u64)>,
+    palette_offset: f64,
     density: f64,
     aa: u32,
-    palette: Arc<Vec<[u8; 3]>>,
 }
 
-#[derive(Clone, Copy)]
-struct Frame {
-    id: u64,
-    view: View,
-    stats: Stats,
-    ms: f64,
-    aa: u32,
+/// The latest request, which is also the current picture.
+struct Job {
+    epoch: u64,
+    params: Params,
+    world: Arc<World>,
+    palette: Vec<Color32>,
+    tiles: Vec<TileId>,
+    cancel: AtomicBool,
 }
 
-#[derive(Default)]
-struct Shared {
-    job: Mutex<Option<Job>>,
-    wake: Condvar,
-    latest: AtomicU64,
-    done: Mutex<Option<(Frame, ColorImage)>>,
+impl Job {
+    fn new(epoch: u64, params: &Params, world: Arc<World>, tiles: Vec<TileId>) -> Arc<Job> {
+        let palette = make_palette(params.seeds.len(), params.palette_offset);
+        Arc::new(Job { epoch, params: params.clone(), world, palette, tiles, cancel: AtomicBool::new(false) })
+    }
 }
 
-fn worker(sh: Arc<Shared>, ctx: egui::Context) {
-    let mut last_world: Option<Arc<World>> = None;
-    loop {
-        let job = {
-            let mut g = sh.job.lock().unwrap();
-            while g.is_none() {
-                g = sh.wake.wait(g).unwrap();
-            }
-            g.take().unwrap()
-        };
-        let latest = &sh.latest;
-        let stale = || latest.load(Relaxed) != job.id;
-        let never = || false;
-        let draw = |level: u32, aa: u32, tiles: Tiles, cancel: &(dyn Fn() -> bool + Sync)| {
-            let t0 = Instant::now();
-            let out = process::render(&job.world, &job.view, level, aa, &job.palette, BACKGROUND, tiles, cancel);
-            let Some((rgba, stats)) = out else { return false };
-            // Same layout as Color32, so this collect reuses the allocation.
-            let pixels = rgba.into_iter().map(|[r, g, b, a]| Color32::from_rgba_premultiplied(r, g, b, a)).collect();
-            let image = ColorImage::new([job.view.w, job.view.h], pixels);
-            let frame = Frame { id: job.id, view: job.view, stats, ms: t0.elapsed().as_secs_f64() * 1e3, aa };
-            *sh.done.lock().unwrap() = Some((frame, image));
-            ctx.request_repaint();
-            true
-        };
-
-        let level = level_for(job.view.scale, job.density);
-        // A new world (seeds edited) has an empty cache: finish its first picture even if
-        // newer jobs arrive, so that dragging a seed keeps updating the screen.
-        let fresh = !last_world.as_ref().is_some_and(|w| Arc::ptr_eq(w, &job.world));
-        last_world = Some(job.world.clone());
-        if !draw(level, 1, Tiles::CachedOnly, &never) {
-            // Instant preview from a neighboring cached level while the exact one is computed.
-            let near = [level + 1, level.saturating_sub(1), level.saturating_sub(2)];
-            for l in near.into_iter().filter(|&l| l != level && l <= MAX_LEVEL) {
-                if draw(l, 1, Tiles::CachedOnly, &never) {
-                    break;
-                }
-            }
-            if !draw(level, 1, Tiles::Compute, if fresh { &never } else { &stale }) {
-                continue;
-            }
-        }
-        if job.aa > 1 && !draw(level, job.aa, Tiles::CachedOnly, &stale) {
-            continue;
-        }
-        if level < MAX_LEVEL {
-            job.world.prefetch(&job.view, level + 1, &stale);
+fn worker(jobs: mpsc::Receiver<Arc<Job>>, done: mpsc::Sender<Rendered>, ctx: egui::Context) {
+    while let Ok(job) = jobs.recv() {
+        let job = jobs.try_iter().last().unwrap_or(job);
+        let Params { density, aa, .. } = job.params;
+        for batch in job.tiles.chunk_by(|a, b| a.0 == b.0) {
+            let level = level_for(batch[0].0, density);
+            let Some(rain) = job.world.rain_for(batch, level, aa, &job.cancel) else { break };
+            batch.par_iter().filter(|_| !job.cancel.load(Relaxed)).for_each(|&id| {
+                let image = render_tile(&job.world, &rain, id, level, aa, &job.palette);
+                let _ = done.send((job.epoch, id, image));
+                ctx.request_repaint();
+            });
         }
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Layout {
     Random,
     Circle,
@@ -96,224 +69,252 @@ enum Layout {
     Manual,
 }
 
-impl Layout {
-    const ALL: [Layout; 4] = [Layout::Random, Layout::Circle, Layout::Grid, Layout::Manual];
-
-    fn label(self) -> &'static str {
-        match self {
-            Layout::Random => "random",
-            Layout::Circle => "circle",
-            Layout::Grid => "grid",
-            Layout::Manual => "manual",
-        }
-    }
-}
-
-fn make_palette(k: usize, salt: u64) -> Vec<[u8; 3]> {
-    let offset = unit(mix(salt));
+fn make_palette(k: usize, offset: f64) -> Vec<Color32> {
     (0..k)
         .map(|i| {
             let i = i as f64;
-            let h = offset + i * 0.618_033_988_75;
-            let s = 0.50 + 0.35 * (i * 0.381_966).fract();
-            let v = 0.70 + 0.28 * (i * 0.754_877_666).fract();
-            egui::ecolor::rgb_from_hsv((h.fract() as f32, s as f32, v as f32)).map(|t| (t * 255.0).round() as u8)
+            let h = (offset + i * 0.618_033_988_75).fract() as f32;
+            let s = (0.50 + 0.35 * (i * 0.381_966).fract()) as f32;
+            let v = (0.70 + 0.28 * (i * 0.754_877_666).fract()) as f32;
+            let [r, g, b] = egui::ecolor::rgb_from_hsv((h, s, v)).map(|t| (t * 255.0).round() as u8);
+            Color32::from_rgb(r, g, b)
         })
         .collect()
 }
 
-fn unit_to_fixed(t: f64) -> u64 {
-    ((t.clamp(0.0, 1.0) * DOMAIN as f64) as u64).min(DOMAIN - 1)
+fn random_seeds(salt: u64, k: usize) -> Vec<(u64, u64)> {
+    let mut rng = SplitMix64::seed_from_u64(salt);
+    (0..k).map(|_| (rng.random_range(0..DOMAIN), rng.random_range(0..DOMAIN))).collect()
 }
 
-fn clamp_to_domain(v: i64) -> u64 {
-    v.clamp(0, DOMAIN as i64 - 1) as u64
+/// Screen span of tile edges `a..b` clipped to `clip`, and the matching texture span.
+/// Clipping in `f64` keeps huge stand-in tiles accurate at deep zoom.
+fn clip_axis(a: f64, b: f64, clip: Rangef) -> Option<(Rangef, Rangef)> {
+    let (p, q) = (a.max(clip.min as f64), b.min(clip.max as f64));
+    let n = (RASTER + 2) as f64;
+    let uv = |v: f64| remap(v, a..=b, 1.0 / n..=(n - 1.0) / n) as f32;
+    (p < q).then(|| (Rangef::new(p as f32, q as f32), Rangef::new(uv(p), uv(q))))
 }
 
-fn random_seed(salt: u64, i: usize) -> (u64, u64) {
-    (mix(salt ^ mix(2 * i as u64)) >> 2, mix(salt ^ mix(2 * i as u64 + 1)) >> 2)
+/// The canvas `rect`, centered on `(cx, cy)`, at `scale` fixed-point units per physical pixel.
+#[derive(Clone, Copy)]
+struct View {
+    cx: i64,
+    cy: i64,
+    scale: f64,
+    rect: Rect,
+    ppp: f32,
+}
+
+impl View {
+    /// Coarsest raster zoom whose texels are no wider than a screen pixel.
+    fn target_z(&self) -> u32 {
+        (DOMAIN as f64 / (RASTER as f64 * self.scale)).log2().ceil().max(0.0) as u32
+    }
+
+    /// Tiles at zoom `z` under the view, plus half a tile of margin so that panning finds them ready.
+    fn tiles(&self, z: u32) -> impl Iterator<Item = TileId> + use<> {
+        let side = (DOMAIN >> z) as f64;
+        let last = (1i64 << z) - 1;
+        let size = self.rect.size() * self.ppp;
+        let range = |c: i64, len: f32| {
+            let half = len as f64 * 0.5 * self.scale + side * 0.5;
+            let tile = |v: f64| ((v / side).floor() as i64).clamp(0, last);
+            tile(c as f64 - half)..=tile(c as f64 + half)
+        };
+        let (xs, ys) = (range(self.cx, size.x), range(self.cy, size.y));
+        ys.flat_map(move |y| xs.clone().map(move |x| (z, x, y)))
+    }
+
+    /// The center moved by pixel offset `u` at `scale` units per pixel; a zoomed-out view can span more than i64.
+    fn shifted(&self, (ux, uy): (f64, f64), scale: f64) -> (i64, i64) {
+        let moved = |c: i64, u: f64| c.saturating_add((u * scale).round() as i64);
+        (moved(self.cx, ux), moved(self.cy, uy))
+    }
+
+    fn recenter(&mut self, u: (f64, f64), scale: f64) {
+        let (x, y) = self.shifted(u, scale);
+        (self.cx, self.cy) = (x.clamp(0, DOMAIN as i64), y.clamp(0, DOMAIN as i64));
+    }
+
+    /// This view magnified twice around pixel offset `u` from its center.
+    fn zoomed_in(&self, u: (f64, f64)) -> View {
+        let mut view = View { scale: self.scale * 0.5, ..*self };
+        view.recenter(u, view.scale);
+        view
+    }
+
+    fn fit_scale(&self) -> f64 {
+        DOMAIN as f64 / (self.rect.size().min_elem().max(1.0) * self.ppp * 0.94) as f64
+    }
+
+    fn reset(&mut self) {
+        (self.cx, self.cy) = ((DOMAIN / 2) as i64, (DOMAIN / 2) as i64);
+        self.scale = self.fit_scale();
+    }
+
+    /// Offset of screen point `p` from the view center, in physical pixels.
+    fn pixel_offset(&self, p: Pos2) -> (f64, f64) {
+        let d = (p - self.rect.center()) * self.ppp;
+        (d.x as f64, d.y as f64)
+    }
+
+    fn to_world(self, p: Pos2) -> (i64, i64) {
+        self.shifted(self.pixel_offset(p), self.scale)
+    }
+
+    fn screen(&self, x: i64, y: i64) -> (f64, f64) {
+        let axis = |center: f32, v: i64, c: i64| center as f64 + (v - c) as f64 / self.scale / self.ppp as f64;
+        let center = self.rect.center();
+        (axis(center.x, x, self.cx), axis(center.y, y, self.cy))
+    }
+
+    fn to_screen(self, x: i64, y: i64) -> Pos2 {
+        let (x, y) = self.screen(x, y);
+        pos2(x as f32, y as f32)
+    }
+
+    /// Zooms keeping `p` fixed, without going through world coordinates that could saturate.
+    fn zoom_at(&mut self, p: Pos2, factor: f64) {
+        let old_scale = self.scale;
+        self.scale = (old_scale / factor).clamp(MIN_SCALE, self.fit_scale() * 4.0);
+        self.recenter(self.pixel_offset(p), old_scale - self.scale);
+    }
+
+    fn pan_pixels(&mut self, dx: f64, dy: f64) {
+        self.recenter((-dx, -dy), self.scale);
+    }
 }
 
 struct App {
-    shared: Arc<Shared>,
-    next_id: u64,
-    dirty: bool,
-
     view: View,
-
     layout: Layout,
     seed_salt: u64,
-    seeds: Vec<(u64, u64)>,
-    rain: u64,
-    world: Arc<World>,
-    palette_salt: u64,
-    palette: Arc<Vec<[u8; 3]>>,
-
-    density: f64,
-    aa: u32,
+    params: Params,
     show_seeds: bool,
 
-    tex: Option<TextureHandle>,
-    shown: Option<Frame>,
+    /// The latest texture of each tile, from any epoch until its replacement arrives.
+    textures: Cache<TileId, (u64, TextureHandle)>,
+    jobs: mpsc::Sender<Arc<Job>>,
+    done: mpsc::Receiver<Rendered>,
+    job: Arc<Job>,
+    missing: usize,
     dragged_seed: Option<usize>,
 }
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let shared = Arc::new(Shared::default());
-        let (sh, ctx) = (shared.clone(), cc.egui_ctx.clone());
-        std::thread::spawn(move || worker(sh, ctx));
+        let (jobs, job_rx) = mpsc::channel();
+        let (done_tx, done) = mpsc::channel();
+        let ctx = cc.egui_ctx.clone();
+        std::thread::spawn(move || worker(job_rx, done_tx, ctx));
         let seed_salt = 1;
-        let seeds: Vec<_> = (0..6).map(|i| random_seed(seed_salt, i)).collect();
-        let rain = 2017;
+        let params = Params { rain: 2017, seeds: random_seeds(seed_salt, 6), palette_offset: 0.0, density: 1.0, aa: 2 };
         App {
-            shared,
-            next_id: 0,
-            dirty: true,
-            view: View { cx: (DOMAIN / 2) as i64, cy: (DOMAIN / 2) as i64, scale: 1.0, w: 0, h: 0 },
+            view: View { cx: 0, cy: 0, scale: 1.0, rect: Rect::ZERO, ppp: 1.0 },
             layout: Layout::Random,
             seed_salt,
-            world: Arc::new(World::new(rain, seeds.clone())),
-            palette: Arc::new(make_palette(seeds.len(), 0)),
-            seeds,
-            rain,
-            palette_salt: 0,
-            density: 1.0,
-            aa: 2,
             show_seeds: true,
-            tex: None,
-            shown: None,
+            textures: Cache::new(TEXTURE_BUDGET),
+            jobs,
+            done,
+            job: Job::new(0, &params, Arc::new(World::new(params.rain, params.seeds.clone())), Vec::new()),
+            params,
+            missing: 0,
             dragged_seed: None,
         }
     }
 
-    fn fit_scale(&self) -> f64 {
-        DOMAIN as f64 / (self.view.w.min(self.view.h).max(1) as f64 * 0.94)
-    }
-
-    fn reset_view(&mut self) {
-        self.view.cx = (DOMAIN / 2) as i64;
-        self.view.cy = (DOMAIN / 2) as i64;
-        self.view.scale = self.fit_scale();
-        self.dirty = true;
-    }
-
     fn regenerate_seeds(&mut self, k: usize) {
-        self.seeds = match self.layout {
-            Layout::Random => (0..k).map(|i| random_seed(self.seed_salt, i)).collect(),
+        let salt = self.seed_salt;
+        let at = |x: f64, y: f64| ((x * DOMAIN as f64) as u64, (y * DOMAIN as f64) as u64);
+        self.params.seeds = match self.layout {
+            Layout::Random => random_seeds(salt, k),
             Layout::Circle => {
-                let phase = unit(mix(self.seed_salt));
+                let phase: f64 = SplitMix64::seed_from_u64(salt).random();
                 (0..k)
-                    .map(|i| {
-                        let a = std::f64::consts::TAU * (i as f64 / k as f64 + phase);
-                        (unit_to_fixed(0.5 + 0.3 * a.cos()), unit_to_fixed(0.5 + 0.3 * a.sin()))
-                    })
+                    .map(|i| std::f64::consts::TAU * (i as f64 / k as f64 + phase))
+                    .map(|a| at(0.5 + 0.3 * a.cos(), 0.5 + 0.3 * a.sin()))
                     .collect()
             }
             Layout::Grid => {
                 let m = (k as f64).sqrt().ceil() as usize;
                 let rows = k.div_ceil(m);
-                (0..k)
-                    .map(|i| {
-                        (
-                            unit_to_fixed(((i % m) as f64 + 0.5) / m as f64),
-                            unit_to_fixed(((i / m) as f64 + 0.5) / rows as f64),
-                        )
-                    })
-                    .collect()
+                (0..k).map(|i| at(((i % m) as f64 + 0.5) / m as f64, ((i / m) as f64 + 0.5) / rows as f64)).collect()
             }
             Layout::Manual => {
-                let mut s = std::mem::take(&mut self.seeds);
-                s.truncate(k);
-                let n = s.len();
-                s.extend((n..k).map(|i| random_seed(self.seed_salt, i)));
-                s
+                let mut seeds = std::mem::take(&mut self.params.seeds);
+                seeds.truncate(k);
+                seeds.extend(random_seeds(salt, k).into_iter().skip(seeds.len()));
+                seeds
             }
         };
-        self.rebuild_world();
     }
 
-    /// Applies a hand edit to the seeds.
-    fn edit_seeds(&mut self, edit: impl FnOnce(&mut Vec<(u64, u64)>)) {
-        edit(&mut self.seeds);
+    fn edit_seeds(&mut self) -> &mut Vec<(u64, u64)> {
         self.layout = Layout::Manual;
-        self.rebuild_world();
+        &mut self.params.seeds
     }
 
-    fn rebuild_world(&mut self) {
-        self.world = Arc::new(World::new(self.rain, self.seeds.clone()));
-        self.rebuild_palette();
-    }
-
-    fn rebuild_palette(&mut self) {
-        self.palette = Arc::new(make_palette(self.seeds.len(), self.palette_salt));
-        self.dirty = true;
-    }
-
-    fn submit(&mut self) {
-        self.next_id += 1;
-        let job = Job {
-            id: self.next_id,
-            world: self.world.clone(),
-            view: self.view,
-            density: self.density,
-            aa: self.aa,
-            palette: self.palette.clone(),
-        };
-        self.shared.latest.store(self.next_id, Relaxed);
-        *self.shared.job.lock().unwrap() = Some(job);
-        self.shared.wake.notify_one();
-        self.dirty = false;
-    }
-
-    /// Offset of screen point `p` from the view center, in physical pixels.
-    fn pixel_offset(&self, rect: Rect, ppp: f32, p: Pos2) -> (f64, f64) {
-        (
-            ((p.x - rect.min.x) * ppp) as f64 - self.view.w as f64 * 0.5,
-            ((p.y - rect.min.y) * ppp) as f64 - self.view.h as f64 * 0.5,
-        )
-    }
-
-    fn to_world(&self, rect: Rect, ppp: f32, p: Pos2) -> (i64, i64) {
-        let (ux, uy) = self.pixel_offset(rect, ppp, p);
-        (
-            self.view.cx.saturating_add((ux * self.view.scale).round() as i64),
-            self.view.cy.saturating_add((uy * self.view.scale).round() as i64),
-        )
-    }
-
-    fn to_screen(&self, rect: Rect, ppp: f32, x: i64, y: i64) -> Pos2 {
-        let ux = x.saturating_sub(self.view.cx) as f64 / self.view.scale + self.view.w as f64 * 0.5;
-        let uy = y.saturating_sub(self.view.cy) as f64 / self.view.scale + self.view.h as f64 * 0.5;
-        rect.min + Vec2::new(ux as f32, uy as f32) / ppp
-    }
-
-    fn nearest_seed(&self, rect: Rect, ppp: f32, p: Pos2) -> Option<usize> {
-        self.seeds
+    fn nearest_seed(&self, p: Pos2) -> Option<usize> {
+        self.params
+            .seeds
             .iter()
             .enumerate()
-            .map(|(i, &(x, y))| (i, self.to_screen(rect, ppp, x as i64, y as i64).distance(p)))
+            .map(|(i, &(x, y))| (i, self.view.to_screen(x as i64, y as i64).distance(p)))
             .filter(|&(_, d)| d < PICK_RADIUS)
-            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .min_by_key(|&(_, d)| OrderedFloat(d))
             .map(|(i, _)| i)
     }
 
-    fn zoom_at(&mut self, rect: Rect, ppp: f32, p: Pos2, factor: f64) {
-        let (wx, wy) = self.to_world(rect, ppp, p);
-        let min_scale = (DOMAIN >> (MAX_LEVEL + 1)) as f64;
-        let max_scale = self.fit_scale() * 4.0;
-        self.view.scale = (self.view.scale / factor).clamp(min_scale, max_scale);
-        let (ux, uy) = self.pixel_offset(rect, ppp, p);
-        self.view.cx = wx - (ux * self.view.scale).round() as i64;
-        self.view.cy = wy - (uy * self.view.scale).round() as i64;
-        self.dirty = true;
+    /// Uploads finished tiles and asks the worker for missing ones, coarsest first. With the view
+    /// complete, it loads what a zoom at `anchor` will show, so that zooming stays sharp.
+    fn update_tiles(&mut self, ctx: &egui::Context, anchor: (f64, f64)) {
+        for (epoch, id, image) in self.done.try_iter() {
+            self.textures.insert(id, (epoch, ctx.load_texture("tile", image, TextureOptions::LINEAR)));
+        }
+        let view = self.view;
+        let z = view.target_z();
+        let old = self.job.clone();
+        let new_epoch = self.params != old.params;
+        let epoch = old.epoch + new_epoch as u64;
+        let stale = |id: &TileId| self.textures.get(id).is_none_or(|t| t.0 != epoch);
+        let mut want: Vec<TileId> = [0, z.saturating_sub(1), z].into_iter().flat_map(|z| view.tiles(z)).filter(stale).collect();
+        want.sort_unstable();
+        want.dedup();
+        self.missing = want.len();
+        if want.is_empty() {
+            let deepest = View { scale: MIN_SCALE, ..view }.target_z();
+            let zoomed_out = View { scale: view.scale * 2.0, ..view }.tiles(z.saturating_sub(1));
+            let zoomed_in = view.zoomed_in(anchor).tiles(z + 1).filter(|_| z < deepest);
+            want = zoomed_out.chain(zoomed_in).filter(stale).collect();
+        }
+        if new_epoch || want.iter().any(|id| !old.tiles.contains(id)) {
+            // While a seed is dragged, the running job finishes so that the screen keeps updating.
+            old.cancel.store(!new_epoch || self.dragged_seed.is_none(), Relaxed);
+            let p = &self.params;
+            let same_world = (p.rain, &p.seeds) == (old.params.rain, &old.params.seeds);
+            let world = if same_world { old.world.clone() } else { Arc::new(World::new(p.rain, p.seeds.clone())) };
+            self.job = Job::new(epoch, p, world, want);
+            self.jobs.send(self.job.clone()).expect("worker runs as long as the app");
+        }
     }
 
-    fn pan_pixels(&mut self, dx: f64, dy: f64) {
-        let lim = DOMAIN as i64;
-        self.view.cx = (self.view.cx - (dx * self.view.scale).round() as i64).clamp(-lim / 2, lim + lim / 2);
-        self.view.cy = (self.view.cy - (dy * self.view.scale).round() as i64).clamp(-lim / 2, lim + lim / 2);
-        self.dirty = true;
+    /// Paints coarse to fine, with the target zoom on top. The root tile covers the whole
+    /// domain, so these layers leave no gap.
+    fn paint_tiles(&self, painter: &egui::Painter) {
+        let z = self.view.target_z();
+        let mut layers: Vec<_> = self.textures.iter().filter(|(id, _)| self.missing > 0 || id.0 == z).collect();
+        layers.sort_unstable_by_key(|&(&(tile_z, ..), _)| (tile_z == z, tile_z));
+        for (&(tile_z, tx, ty), (_, texture)) in layers {
+            let side = (DOMAIN >> tile_z) as i64;
+            let (ax, ay) = self.view.screen(tx * side, ty * side);
+            let (bx, by) = self.view.screen((tx + 1) * side, (ty + 1) * side);
+            let (clip_x, clip_y) = (self.view.rect.x_range(), self.view.rect.y_range());
+            if let (Some((x, u)), Some((y, v))) = (clip_axis(ax, bx, clip_x), clip_axis(ay, by, clip_y)) {
+                painter.image(texture.id(), Rect::from_x_y_ranges(x, y), Rect::from_x_y_ranges(u, v), Color32::WHITE);
+            }
+        }
     }
 
     fn controls(&mut self, ui: &mut egui::Ui) {
@@ -322,72 +323,59 @@ impl App {
         ui.separator();
 
         ui.strong("Seeds");
-        let old_layout = self.layout;
-        egui::ComboBox::from_label("layout").selected_text(self.layout.label()).show_ui(ui, |ui| {
-            for layout in Layout::ALL {
-                ui.selectable_value(&mut self.layout, layout, layout.label());
+        let before = (self.layout, self.seed_salt, self.params.seeds.len());
+        egui::ComboBox::from_label("layout").selected_text(format!("{:?}", self.layout)).show_ui(ui, |ui| {
+            for layout in [Layout::Random, Layout::Circle, Layout::Grid, Layout::Manual] {
+                ui.selectable_value(&mut self.layout, layout, format!("{layout:?}"));
             }
         });
-        let mut k = self.seeds.len();
-        let k_changed = ui.add(egui::Slider::new(&mut k, 1..=5000).logarithmic(true).text("count")).changed();
-        let mut reshuffle = false;
+        let mut k = before.2;
+        ui.add(egui::Slider::new(&mut k, 1..=5000).logarithmic(true).text("count"));
         ui.horizontal(|ui| {
             if ui.button("New positions").clicked() {
-                self.seed_salt = mix(self.seed_salt);
-                reshuffle = true;
+                self.seed_salt = rand::random();
+                if self.layout == Layout::Manual {
+                    self.layout = Layout::Random;
+                }
             }
             ui.checkbox(&mut self.show_seeds, "show");
         });
-        if reshuffle && self.layout == Layout::Manual {
-            self.layout = Layout::Random;
-        }
-        if reshuffle || k_changed || self.layout != old_layout {
+        if (self.layout, self.seed_salt, k) != before {
             self.regenerate_seeds(k);
         }
         if ui.button("New colors").clicked() {
-            self.palette_salt = mix(self.palette_salt ^ 0x5bd1);
-            self.rebuild_palette();
+            self.params.palette_offset = rand::random();
         }
 
         ui.separator();
         ui.strong("Rain");
         ui.horizontal(|ui| {
             ui.label("realization");
-            if ui.add(egui::DragValue::new(&mut self.rain)).changed() {
-                self.rebuild_world();
-            }
+            ui.add(egui::DragValue::new(&mut self.params.rain));
             if ui.button("New").clicked() {
-                self.rain = mix(self.rain) % 1_000_000;
-                self.rebuild_world();
+                self.params.rain = rand::random_range(0..1_000_000);
             }
         });
 
         ui.separator();
         ui.strong("Quality");
-        let density = egui::Slider::new(&mut self.density, 0.25..=4.0).logarithmic(true).text("particles / pixel (min)");
-        if ui.add(density).changed() {
-            self.dirty = true;
-        }
-        if ui.add(egui::Slider::new(&mut self.aa, 1..=4).text("supersampling")).changed() {
-            self.dirty = true;
-        }
+        ui.add(egui::Slider::new(&mut self.params.density, 0.25..=4.0).logarithmic(true).text("particles / texel (min)"));
+        ui.add(egui::Slider::new(&mut self.params.aa, 1..=4).text("supersampling"));
 
         ui.separator();
         ui.strong("View");
-        let zoom = self.fit_scale() / self.view.scale;
-        ui.label(format!("zoom ×{zoom:.3e}"));
-        if let Some(f) = self.shown {
-            ui.label(format!("n ≈ {:.3e} rain points", f.stats.s_t));
-            ui.label(format!("level {} · {} tiles", f.stats.level, f.stats.tiles));
-            ui.label(format!("{:.0} ms · {}×{} samples/px", f.ms, f.aa, f.aa));
-            ui.label(format!(
-                "cache: {:.1} M particles · {} memoized ancestors",
-                f.stats.cached_particles as f64 / 1e6,
-                f.stats.memo
-            ));
-        }
+        let z = self.view.target_z();
+        let level = level_for(z, self.params.density);
+        ui.label(format!("zoom ×{:.3e}", self.view.fit_scale() / self.view.scale));
+        ui.label(format!("n ≈ {:.3e} rain points", s_top(level)));
+        ui.label(format!("level {level} · tile zoom {z} · {} tiles missing", self.missing));
+        ui.label(format!(
+            "cache: {:.1} M particles · {} textures",
+            self.job.world.cached_particles() as f64 / 1e6,
+            self.textures.len()
+        ));
         if ui.button("Reset view (R)").clicked() {
-            self.reset_view();
+            self.view.reset();
         }
 
         ui.separator();
@@ -401,118 +389,80 @@ impl App {
         let rect = ui.max_rect();
         let resp = ui.allocate_rect(rect, Sense::click_and_drag());
         let ctx = ui.ctx().clone();
-        let ppp = ctx.pixels_per_point();
-        let (w, h) = (((rect.width() * ppp).round() as usize).max(1), ((rect.height() * ppp).round() as usize).max(1));
-        if (w, h) != (self.view.w, self.view.h) {
-            let first = self.view.w == 0;
-            self.view.w = w;
-            self.view.h = h;
-            if first {
-                self.reset_view();
-            }
-            self.dirty = true;
+        let first_frame = self.view.rect == Rect::ZERO;
+        (self.view.rect, self.view.ppp) = (rect, ctx.pixels_per_point());
+        if first_frame {
+            self.view.reset();
         }
 
         let (scroll, pinch, mods) = ctx.input(|i| (i.smooth_scroll_delta().y, i.zoom_delta(), i.modifiers));
         let pointer = resp.hover_pos().unwrap_or(rect.center());
         if resp.hovered() && (scroll != 0.0 || pinch != 1.0) {
-            let factor = pinch as f64 * (scroll as f64 * 0.004).exp();
-            self.zoom_at(rect, ppp, pointer, factor);
+            self.view.zoom_at(pointer, pinch as f64 * (scroll as f64 * 0.004).exp());
         }
 
-        if resp.drag_started() && mods.command {
-            self.dragged_seed = resp.interact_pointer_pos().and_then(|p| self.nearest_seed(rect, ppp, p));
+        let press = resp.interact_pointer_pos();
+        if resp.drag_started() {
+            self.dragged_seed = press.filter(|_| mods.command).and_then(|p| self.nearest_seed(p));
         }
         if resp.dragged() {
-            if let (Some(i), Some(p)) = (self.dragged_seed, resp.interact_pointer_pos()) {
-                let (x, y) = self.to_world(rect, ppp, p);
-                self.edit_seeds(|s| s[i] = (clamp_to_domain(x), clamp_to_domain(y)));
+            if let (Some(i), Some(p)) = (self.dragged_seed, press) {
+                let (x, y) = self.view.to_world(p);
+                let clamp = |v: i64| v.clamp(0, DOMAIN as i64 - 1) as u64;
+                self.edit_seeds()[i] = (clamp(x), clamp(y));
             } else {
-                let d = resp.drag_delta() * ppp;
-                self.pan_pixels(d.x as f64, d.y as f64);
+                let d = resp.drag_delta() * self.view.ppp;
+                self.view.pan_pixels(d.x as f64, d.y as f64);
             }
         }
         if resp.drag_stopped() {
             self.dragged_seed = None;
         }
-        if resp.clicked() && mods.shift
-            && let Some(p) = resp.interact_pointer_pos()
+        if resp.clicked()
+            && mods.shift
+            && let Some(p) = press
         {
-            let (x, y) = self.to_world(rect, ppp, p);
+            let (x, y) = self.view.to_world(p);
             if (0..DOMAIN as i64).contains(&x) && (0..DOMAIN as i64).contains(&y) {
-                self.edit_seeds(|s| s.push((x as u64, y as u64)));
+                self.edit_seeds().push((x as u64, y as u64));
             }
         }
-        if resp.secondary_clicked() && self.seeds.len() > 1
-            && let Some(i) = resp.interact_pointer_pos().and_then(|p| self.nearest_seed(rect, ppp, p))
+        if resp.secondary_clicked()
+            && self.params.seeds.len() > 1
+            && let Some(i) = press.and_then(|p| self.nearest_seed(p))
         {
-            self.edit_seeds(|s| {
-                s.remove(i);
-            });
+            self.edit_seeds().remove(i);
         }
 
         if !ctx.egui_wants_keyboard_input() {
-            let step = 0.1 * w.min(h) as f64;
-            let keys = ctx.input(|i| {
-                [
-                    i.key_down(egui::Key::ArrowLeft),
-                    i.key_down(egui::Key::ArrowRight),
-                    i.key_down(egui::Key::ArrowUp),
-                    i.key_down(egui::Key::ArrowDown),
-                    i.key_down(egui::Key::Plus) || i.key_down(egui::Key::Equals),
-                    i.key_down(egui::Key::Minus),
-                    i.key_pressed(egui::Key::R),
-                ]
-            });
-            let dt = ctx.input(|i| i.stable_dt).min(0.05) as f64 * 6.0;
-            if keys[0] || keys[1] || keys[2] || keys[3] {
-                let dx = (keys[0] as i32 - keys[1] as i32) as f64 * step * dt;
-                let dy = (keys[2] as i32 - keys[3] as i32) as f64 * step * dt;
-                self.pan_pixels(dx, dy);
+            use egui::Key::*;
+            let key = |k| ctx.input(|i| i.key_down(k)) as i32 as f64;
+            let (dx, dy, dz) = (key(ArrowLeft) - key(ArrowRight), key(ArrowUp) - key(ArrowDown), key(Plus).max(key(Equals)) - key(Minus));
+            let dt = ctx.input(|i| i.stable_dt.min(0.05)) as f64 * 6.0;
+            if dx != 0.0 || dy != 0.0 {
+                let step = 0.1 * (rect.size().min_elem() * self.view.ppp) as f64 * dt;
+                self.view.pan_pixels(dx * step, dy * step);
                 ctx.request_repaint();
             }
-            if keys[4] || keys[5] {
-                let f = if keys[4] { (1.5 * dt).exp() } else { (-1.5 * dt).exp() };
-                self.zoom_at(rect, ppp, rect.center(), f);
+            if dz != 0.0 {
+                self.view.zoom_at(rect.center(), (1.5 * dt * dz).exp());
                 ctx.request_repaint();
             }
-            if keys[6] {
-                self.reset_view();
+            if ctx.input(|i| i.key_pressed(R)) {
+                self.view.reset();
             }
         }
 
-        if self.dirty {
-            self.submit();
-        }
-
-        if let Some((frame, image)) = self.shared.done.lock().unwrap().take()
-            && self.shown.is_none_or(|s| frame.id >= s.id)
-        {
-            match &mut self.tex {
-                Some(t) => t.set(image, TextureOptions::LINEAR),
-                None => self.tex = Some(ctx.load_texture("coloring", image, TextureOptions::LINEAR)),
-            }
-            self.shown = Some(frame);
-        }
-
+        self.update_tiles(&ctx, self.view.pixel_offset(pointer));
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 0.0, Color32::from_rgb(BACKGROUND[0], BACKGROUND[1], BACKGROUND[2]));
-        if let (Some(tex), Some(f)) = (&self.tex, self.shown) {
-            // Re-project the last finished frame onto the current view while the next one renders.
-            let half_w = (f.view.w as f64 * 0.5 * f.view.scale) as i64;
-            let half_h = (f.view.h as f64 * 0.5 * f.view.scale) as i64;
-            let img_rect = Rect::from_min_max(
-                self.to_screen(rect, ppp, f.view.cx - half_w, f.view.cy - half_h),
-                self.to_screen(rect, ppp, f.view.cx + half_w, f.view.cy + half_h),
-            );
-            painter.image(tex.id(), img_rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
-        }
+        painter.rect_filled(rect, 0.0, BACKGROUND);
+        self.paint_tiles(&painter);
 
-        if self.show_seeds && self.seeds.len() <= 2000 {
-            for (&(x, y), c) in self.seeds.iter().zip(self.palette.iter()) {
-                let p = self.to_screen(rect, ppp, x as i64, y as i64);
+        if self.show_seeds && self.params.seeds.len() <= 2000 {
+            for (&(x, y), &color) in self.params.seeds.iter().zip(&self.job.palette) {
+                let p = self.view.to_screen(x as i64, y as i64);
                 if rect.expand(8.0).contains(p) {
-                    painter.circle(p, 4.5, Color32::from_rgb(c[0], c[1], c[2]), Stroke::new(1.5, Color32::BLACK));
+                    painter.circle(p, 4.5, color, Stroke::new(1.5, Color32::BLACK));
                     painter.circle_stroke(p, 6.0, Stroke::new(1.0, Color32::WHITE));
                 }
             }
