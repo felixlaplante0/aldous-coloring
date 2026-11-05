@@ -1,0 +1,9 @@
+[package]
+name = "aldous_coloring"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+dashmap = "6.2.1"
+eframe = "0.37.0"
+rayon = "1.12.0"
