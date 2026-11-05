@@ -12,6 +12,7 @@ use rand::{Rng, RngExt, SeedableRng};
 use rand_distr::{Distribution, Poisson};
 use rand_xoshiro::SplitMix64;
 use rayon::prelude::*;
+use std::convert::Infallible;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::{Arc, LazyLock};
@@ -269,7 +270,7 @@ fn seed_index(p: Particle) -> u32 {
 
 /// A rectangle of rain tiles of one level, kept alive whatever the cache evicts.
 #[derive(Default)]
-pub struct TileSet {
+struct TileSet {
     tx0: i64,
     ty0: i64,
     ntx: i64,
@@ -319,6 +320,9 @@ impl World {
     /// with the coarser tiles holding the colors of their older particles. Finished tiles
     /// stay cached if `cancel` interrupts the call.
     fn tile_set(&self, level: u32, xs: (i64, i64), ys: (i64, i64), cancel: &AtomicBool) -> Option<TileSet> {
+        if cancel.load(Relaxed) {
+            return None;
+        }
         let (tx0, tx1, ty0, ty1) = (xs.0 / TILE, xs.1 / TILE, ys.0 / TILE, ys.1 / TILE);
         let keys: Vec<TileKey> = (ty0..=ty1).flat_map(|ty| (tx0..=tx1).map(move |tx| (level, tx, ty))).collect();
         let tiles = match keys.iter().map(|k| self.tiles.get(k)).collect::<Option<Vec<_>>>() {
@@ -333,33 +337,16 @@ impl World {
                     };
                     self.tile_set(level - 1, halve(tx0, tx1), halve(ty0, ty1), cancel)?
                 };
-                if cancel.load(Relaxed) {
-                    return None;
-                }
+                // Tile::compute stays serial: a rayon steal while this key is locked could deadlock.
                 keys.par_iter()
                     .map(|&k| {
-                        self.tiles.get(&k).unwrap_or_else(|| {
-                            let tile = Arc::new(Tile::compute(self, k, &coarse));
-                            self.tiles.insert(k, tile.clone());
-                            tile
-                        })
+                        let compute = || Ok::<_, Infallible>(Arc::new(Tile::compute(self, k, &coarse)));
+                        self.tiles.get_or_insert_with(&k, compute).unwrap()
                     })
                     .collect()
             }
         };
         Some(TileSet { tx0, ty0, ntx: tx1 - tx0 + 1, tiles })
-    }
-
-    /// The rain that raster tiles `ids` of one zoom need, or `None` if `cancel` fired.
-    pub fn rain_for(&self, ids: &[TileId], level: u32, aa: u32, cancel: &AtomicBool) -> Option<TileSet> {
-        let shift = BITS - level;
-        let z = ids[0].0;
-        let span = |t: fn(&TileId) -> i64| {
-            let (lo, hi) = (ids.iter().map(t).min().unwrap(), ids.iter().map(t).max().unwrap());
-            let (first, last) = (sample_coords(lo, z, aa)[0], *sample_coords(hi, z, aa).last().unwrap());
-            ((first >> shift) as i64, (last >> shift) as i64)
-        };
-        self.tile_set(level, span(|id| id.1), span(|id| id.2), cancel)
     }
 
     /// Nearest seed or rain particle with arrival time `< s_lim`.
@@ -423,10 +410,13 @@ fn sample_coords(t: i64, z: u32, aa: u32) -> Vec<u64> {
         .collect()
 }
 
-/// Renders raster tile `(z, tx, ty)` from the rain of `level`, with `aa x aa` samples per texel.
-pub fn render_tile(world: &World, rain: &TileSet, (z, tx, ty): TileId, level: u32, aa: u32, palette: &[Color32]) -> ColorImage {
+/// Renders raster tile `(z, tx, ty)` from the rain of `level`, with `aa x aa` samples per texel,
+/// or returns `None` if `cancel` fired while computing the rain.
+pub fn render_tile(world: &World, (z, tx, ty): TileId, level: u32, aa: u32, palette: &[Color32], cancel: &AtomicBool) -> Option<ColorImage> {
     let shift = BITS - level;
     let (xs, ys) = (sample_coords(tx, z, aa), sample_coords(ty, z, aa));
+    let cells = |v: &[u64]| ((v[0] >> shift) as i64, (v[v.len() - 1] >> shift) as i64);
+    let rain = world.tile_set(level, cells(&xs), cells(&ys), cancel)?;
     let color = &|x: u64, y: u64| {
         let tile = rain.at((x >> shift) as i64, (y >> shift) as i64);
         tile.color_near(x, y).unwrap_or_else(|| world.color_of(Particle { x, y, s: s_top(level) }))
@@ -446,7 +436,7 @@ pub fn render_tile(world: &World, rain: &TileSet, (z, tx, ty): TileId, level: u3
             })
         })
         .collect();
-    ColorImage::new([RASTER + 2, RASTER + 2], pixels)
+    Some(ColorImage::new([RASTER + 2, RASTER + 2], pixels))
 }
 
 #[cfg(test)]
@@ -463,8 +453,7 @@ mod tests {
         for (z, density) in [(0, 1.0), (5, 1.0), (14, 2.0), (30, 1.0)] {
             let id = (z, ((DOMAIN / 3) >> (BITS - z)) as i64, ((DOMAIN / 2) >> (BITS - z)) as i64);
             let level = level_for(z, density);
-            let rain = world.rain_for(&[id], level, 1, &AtomicBool::new(false)).unwrap();
-            let image = render_tile(&world, &rain, id, level, 1, &palette);
+            let image = render_tile(&world, id, level, 1, &palette, &AtomicBool::new(false)).unwrap();
             let (xs, ys) = (sample_coords(id.1, z, 1), sample_coords(id.2, z, 1));
             for j in (0..xs.len()).step_by(7) {
                 for i in (0..xs.len()).step_by(7) {

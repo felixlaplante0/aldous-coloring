@@ -15,6 +15,8 @@ const PICK_RADIUS: f32 = 14.0;
 const MIN_SCALE: f64 = (DOMAIN >> (MAX_LEVEL + 1)) as f64;
 /// Raster tiles kept on the GPU, about 266 KiB each.
 const TEXTURE_BUDGET: usize = 1024;
+/// Enough to keep the cores busy, few enough that tiles still appear nearest the pointer first.
+const TILES_AT_ONCE: usize = 4;
 
 type Rendered = (u64, TileId, ColorImage);
 
@@ -49,14 +51,17 @@ fn worker(jobs: mpsc::Receiver<Arc<Job>>, done: mpsc::Sender<Rendered>, ctx: egu
     while let Ok(job) = jobs.recv() {
         let job = jobs.try_iter().last().unwrap_or(job);
         let Params { density, aa, .. } = job.params;
-        for batch in job.tiles.chunk_by(|a, b| a.0 == b.0) {
-            let level = level_for(batch[0].0, density);
-            let Some(rain) = job.world.rain_for(batch, level, aa, &job.cancel) else { break };
-            batch.par_iter().filter(|_| !job.cancel.load(Relaxed)).for_each(|&id| {
-                let image = render_tile(&job.world, &rain, id, level, aa, &job.palette);
-                let _ = done.send((job.epoch, id, image));
-                ctx.request_repaint();
+        for group in job.tiles.chunks(TILES_AT_ONCE) {
+            group.par_iter().for_each(|&id| {
+                let level = level_for(id.0, density);
+                if let Some(image) = render_tile(&job.world, id, level, aa, &job.palette, &job.cancel) {
+                    let _ = done.send((job.epoch, id, image));
+                    ctx.request_repaint();
+                }
             });
+            if job.cancel.load(Relaxed) {
+                break;
+            }
         }
     }
 }
@@ -267,8 +272,8 @@ impl App {
             .map(|(i, _)| i)
     }
 
-    /// Uploads finished tiles and asks the worker for missing ones, coarsest first. With the view
-    /// complete, it loads what a zoom at `anchor` will show, so that zooming stays sharp.
+    /// Uploads finished tiles and asks the worker for missing ones, coarsest and nearest to `anchor`
+    /// first. With the view complete, it loads what a zoom at `anchor` will show.
     fn update_tiles(&mut self, ctx: &egui::Context, anchor: (f64, f64)) {
         for (epoch, id, image) in self.done.try_iter() {
             self.textures.insert(id, (epoch, ctx.load_texture("tile", image, TextureOptions::LINEAR)));
@@ -289,6 +294,12 @@ impl App {
             let zoomed_in = view.zoomed_in(anchor).tiles(z + 1).filter(|_| z < deepest);
             want = zoomed_out.chain(zoomed_in).filter(stale).collect();
         }
+        let (ax, ay) = view.shifted(anchor, view.scale);
+        want.sort_by_cached_key(|&(tile_z, x, y)| {
+            let side = (DOMAIN >> tile_z) as f64;
+            let dist = |t: i64, a: i64| (t as f64 + 0.5 - a as f64 / side).abs();
+            (tile_z, OrderedFloat(dist(x, ax).max(dist(y, ay))))
+        });
         if new_epoch || want.iter().any(|id| !old.tiles.contains(id)) {
             // While a seed is dragged, the running job finishes so that the screen keeps updating.
             old.cancel.store(!new_epoch || self.dragged_seed.is_none(), Relaxed);
